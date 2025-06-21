@@ -1,0 +1,262 @@
+version: '3.8'
+
+services:
+  # Message Queue Layer
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # Data Storage Layer
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: adminpassword
+      DOCKER_INFLUXDB_INIT_ORG: system-health
+      DOCKER_INFLUXDB_INIT_BUCKET: metrics
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: system-health-token
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+
+  neo4j:
+    image: neo4j:5.15
+    container_name: neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+      - neo4j-import:/var/lib/neo4j/import
+      - neo4j-plugins:/plugins
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+
+  weaviate:
+    image: semitechnologies/weaviate:1.22.4
+    container_name: weaviate
+    ports:
+      - "8080:8080"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'none'
+      ENABLE_MODULES: 'text2vec-openai,text2vec-cohere,text2vec-huggingface,ref2vec-centroid,generative-openai,qna-openai'
+      CLUSTER_HOSTNAME: 'node1'
+    volumes:
+      - weaviate-data:/var/lib/weaviate
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+
+  # Monitoring & Observability
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards
+
+  # ML Model Management
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:2.8.1
+    container_name: mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      - MLFLOW_TRACKING_URI=sqlite:///mlflow.db
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=./mlruns
+    volumes:
+      - mlflow-data:/mlflow
+    command: mlflow server --host 0.0.0.0 --port 5000
+
+  # Application Services
+  health-scoring-service:
+    build:
+      context: .
+      dockerfile: services/health_scoring/Dockerfile
+    container_name: health-scoring-service
+    ports:
+      - "8001:8000"
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      - INFLUXDB_URL=http://influxdb:8086
+      - REDIS_URL=redis://redis:6379
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    depends_on:
+      - kafka
+      - influxdb
+      - redis
+      - mlflow
+    volumes:
+      - ./services/health_scoring:/app
+
+  prediction-service:
+    build:
+      context: .
+      dockerfile: services/prediction/Dockerfile
+    container_name: prediction-service
+    ports:
+      - "8002:8000"
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      - INFLUXDB_URL=http://influxdb:8086
+      - REDIS_URL=redis://redis:6379
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      - kafka
+      - influxdb
+      - redis
+      - mlflow
+    volumes:
+      - ./services/prediction:/app
+
+  conversation-service:
+    build:
+      context: .
+      dockerfile: services/conversation/Dockerfile
+    container_name: conversation-service
+    ports:
+      - "8003:8000"
+    environment:
+      - WEAVIATE_URL=http://weaviate:8080
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - NEO4J_URL=bolt://neo4j:7687
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      - weaviate
+      - elasticsearch
+      - neo4j
+    volumes:
+      - ./services/conversation:/app
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api_gateway/Dockerfile
+    container_name: api-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - HEALTH_SERVICE_URL=http://health-scoring-service:8000
+      - PREDICTION_SERVICE_URL=http://prediction-service:8000
+      - CONVERSATION_SERVICE_URL=http://conversation-service:8000
+    depends_on:
+      - health-scoring-service
+      - prediction-service
+      - conversation-service
+    volumes:
+      - ./services/api_gateway:/app
+
+  # Data Simulator (for demo purposes)
+  data-simulator:
+    build:
+      context: .
+      dockerfile: services/data_simulator/Dockerfile
+    container_name: data-simulator
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      - INFLUXDB_URL=http://influxdb:8086
+      - SIMULATION_INTERVAL=30
+    depends_on:
+      - kafka
+      - influxdb
+    volumes:
+      - ./services/data_simulator:/app
+
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  influxdb-data:
+  neo4j-data:
+  neo4j-logs:
+  neo4j-import:
+  neo4j-plugins:
+  elasticsearch-data:
+  weaviate-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  mlflow-data: 
